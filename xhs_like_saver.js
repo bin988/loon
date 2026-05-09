@@ -5,22 +5,19 @@
  * 平台：Loon 3.x (iOS 15+)
  *
  * 拦截处理三个 API 端点：
- *   /api/sns/v1/note/imagefeed  - 缓存图文笔记图片 URL
+ *   /api/sns/v1/note/imagefeed    - 缓存图文笔记图片 URL
  *   /api/sns/v1/note/detailfeed/preload - 缓存视频笔记视频 URL
- *   /api/sns/v1/note/like        - 检测点赞，触发保存
+ *   /api/sns/v1/note/like          - 检测点赞，触发保存
  *
  * 使用方法：
  *   1. 在 Loon 中导入 XHSLikeSaver.plugin
- *   2. 将本脚本放入 Loon 的 Scripts 目录
- *   3. 确保已安装并信任 MITM 证书
- *   4. 在 Loon 配置中开启小红书 (edith.xiaohongshu.com) 的 MITM
- *   5. 浏览小红书时自动缓存，点赞时自动保存
+ *   2. 确保已安装并信任 MITM 证书
+ *   3. MITM hostname 只需 edith.xiaohongshu.com（不要加 CDN 域名）
+ *   4. 浏览小红书时自动缓存，点赞时弹出通知
  *
- * 保存机制说明：
- *   由于 Loon 脚本 API 限制，无法直接写入系统相册。
- *   本插件会通过 iOS 通知展示图片/视频，
- *   点击通知可跳转到图片进行保存。
- *   如需自动保存到相册，可配合 Apple 快捷指令使用。
+ * 保存机制：
+ *   点赞后通过 iOS 通知展示图片列表，所有原始图片链接自动复制到剪贴板，
+ *   用户可粘贴到浏览器批量下载，或逐一点击保存。
  */
 
 // ======================== 常量 ========================
@@ -63,6 +60,19 @@ function log(msg) {
   console.log('[XHS ' + now() + '] ' + msg);
 }
 
+function clip(str, maxLen) {
+  if (!str) return '';
+  return str.length > maxLen ? str.substring(0, maxLen) + '…' : str;
+}
+
+function shortUrl(url, maxLen) {
+  if (!url) return '';
+  maxLen = maxLen || 55;
+  // Remove protocol prefix for shorter display
+  var s = url.replace(/^https?:\/\//, '');
+  return s.length > maxLen ? s.substring(0, maxLen) + '…' : s;
+}
+
 // ======================== 缓存笔记数据 ========================
 
 /**
@@ -89,8 +99,8 @@ function cacheImagefeed() {
     for (var i = 0; i < imagesList.length; i++) {
       var img = imagesList[i];
       images.push({
-        url: img.url || null,           // 预览图
-        original: img.original || null,  // 原图
+        url: img.url || null,
+        original: img.original || null,
         large: img.url_size_large || img.url || null,
         fileid: img.fileid || null,
         width: img.width || 0,
@@ -99,10 +109,8 @@ function cacheImagefeed() {
     }
 
     var authorName = '';
-    var authorAvatar = '';
     if (items[0].user) {
       authorName = items[0].user.nickname || items[0].user.name || '';
-      authorAvatar = items[0].user.image || '';
     }
 
     var noteData = {
@@ -111,7 +119,6 @@ function cacheImagefeed() {
       imageCount: images.length,
       desc: clip(note.desc || '', 100),
       author: authorName,
-      authorAvatar: authorAvatar,
       cachedAt: Date.now()
     };
 
@@ -198,10 +205,10 @@ function cachePreload() {
   $done();
 }
 
-// ======================== 保存到相册处理 ========================
+// ======================== 通知处理 ========================
 
 /**
- * 处理点赞 - 从缓存中获取笔记信息并触发保存
+ * 处理点赞 - 从缓存中获取笔记信息并触发通知
  */
 function handleLike() {
   var noteId = extractNoteIdFromBody($request.body);
@@ -232,7 +239,7 @@ function handleLike() {
     log('未命中缓存: ' + noteId);
     $notification.post(
       '❤️ 已点赞',
-      '提示：浏览笔记详情页后再点赞可自动保存',
+      '浏览笔记详情页后再点赞可自动保存',
       '打开笔记详情页刷新后，下次点赞即可自动保存'
     );
     $done();
@@ -248,7 +255,7 @@ function handleLike() {
     return;
   }
 
-  // 防重复下载（30秒内不重复）
+  // 防重复触发（30秒内不重复）
   var lastDl = $persistentStore.read(dlKey(noteId));
   if (lastDl && (Date.now() - parseInt(lastDl)) < 30000) {
     log('30秒内已触发过 ' + noteId + '，跳过');
@@ -267,49 +274,64 @@ function handleLike() {
 }
 
 /**
- * 通知图片笔记 - 通过 iOS 通知展示图片，点击可跳转保存
- *
- * 注意：Loon 的 $done() 会释放脚本引擎，setTimeout 在 $done() 后不会执行。
- * 因此仅发送一条通知（展示第一张图），其余图片数量在通知文字中体现。
+ * 通知图片笔记 - 将所有图片链接复制到剪贴板，通知中展示链接列表
  */
 function notifyImages(noteId, noteData) {
   var images = noteData.images || [];
   if (images.length === 0) {
-    $notification.post('小红书图片保存', '⚠️ 没有图片', '笔记中没有找到图片信息');
+    $notification.post('小红书图片保存', '⚠️ 没有找到图片', '笔记中没有图片信息');
     $done();
     return;
   }
 
-  // 使用原图或大图作为通知媒体
-  var firstImg = images[0];
-  var mediaUrl = firstImg.original || firstImg.large || firstImg.url;
-  // 去掉中间处理参数，保留原始质量（但保留签名参数）
-  var cleanUrl = mediaUrl;
-
-  var author = noteData.author || '';
-  var desc = noteData.desc || '';
-  var totalCount = images.length;
-
-  var title = '❤️ ' + (author ? author + ' ' : '') + totalCount + '张图已保存';
-  var subtitle = clip(desc, 60);
-  var content = '点击长按可保存到相册';
-  if (totalCount > 1) {
-    content = '共 ' + totalCount + ' 张 · 点击打开 · 长按保存';
+  // 收集所有可用的原始图片 URL
+  var urls = [];
+  for (var i = 0; i < images.length; i++) {
+    var u = images[i].original || images[i].large || images[i].url;
+    if (u) urls.push(u);
   }
 
-  var attach = {
-    mediaUrl: cleanUrl,
-    openUrl: cleanUrl,
-    clipboard: '作者: ' + author + ' ｜ ' + '笔记ID: ' + noteId
-  };
+  if (urls.length === 0) {
+    $notification.post('小红书图片保存', '⚠️ 没有图片链接', '缓存中没有有效的图片 URL');
+    $done();
+    return;
+  }
 
-  $notification.post(title, subtitle, content, attach);
-  log('通知已发送: ' + noteId + ' (' + totalCount + ' 张图)');
+  // 剪贴板：放全部完整 URL，每行一个
+  var clipboardText = urls.join('\n');
+
+  // 第一个 URL 用于点击通知时跳转
+  var firstUrl = urls[0];
+
+  // 构建通知正文
+  var author = noteData.author || '';
+  var desc = noteData.desc || '';
+
+  var bodyLines = ['📋 共 ' + urls.length + ' 个链接已复制到剪贴板:'];
+  for (var i = 0; i < urls.length; i++) {
+    bodyLines.push((i + 1) + '. ' + shortUrl(urls[i]));
+  }
+  var body = bodyLines.join('\n');
+
+  // iOS 通知正文长度限制，截断避免被吞
+  if (body.length > 400) {
+    body = body.substring(0, 400) + '…\n📋 完整链接在剪贴板中';
+  }
+
+  var title = '❤️ ' + urls.length + '张图' + (author ? ' - ' + author : '');
+  var subtitle = clip(desc, 60);
+
+  $notification.post(title, subtitle, body, {
+    openUrl: firstUrl,
+    clipboard: clipboardText
+  });
+
+  log('通知已发送: ' + noteId + ' (' + urls.length + ' 张图)');
   $done();
 }
 
 /**
- * 通知视频笔记
+ * 通知视频笔记 - 将视频链接复制到剪贴板
  */
 function notifyVideo(noteId, noteData) {
   var videoUrl = noteData.videoUrl || (noteData.videoUrls && noteData.videoUrls[0]);
@@ -319,29 +341,36 @@ function notifyVideo(noteId, noteData) {
     return;
   }
 
+  var allUrls = noteData.videoUrls && noteData.videoUrls.length > 0
+    ? noteData.videoUrls : [videoUrl];
+  var clipboardText = allUrls.join('\n');
+
   var author = noteData.author || '';
   var desc = noteData.desc || '';
   var duration = noteData.videoDuration || 0;
   var durationSec = Math.floor(duration / 1000);
 
-  var title = '🎬 ' + (author ? author + ' ' : '') + '视频已保存';
+  var bodyLines = ['🎬 视频链接已复制到剪贴板:'];
+  for (var i = 0; i < allUrls.length; i++) {
+    bodyLines.push((i + 1) + '. ' + shortUrl(allUrls[i]));
+  }
+  var body = bodyLines.join('\n');
+
+  if (body.length > 400) {
+    body = body.substring(0, 400) + '…\n📋 完整链接在剪贴板中';
+  }
+
+  var title = '🎬 视频' + (author ? ' - ' + author : '');
   var subtitle = clip(desc, 60);
-  var content = '时长 ' + durationSec + '秒 | 点击打开保存';
+  var content = '时长 ' + durationSec + '秒 | 链接已复制 | 点击打开';
 
-  var attach = {
-    mediaUrl: videoUrl,
+  $notification.post(title, subtitle, body, {
     openUrl: videoUrl,
-    clipboard: '笔记作者: ' + author + ' ｜ ' + '笔记ID: ' + noteId
-  };
+    clipboard: clipboardText
+  });
 
-  $notification.post(title, subtitle, content, attach);
   log('视频通知已发送: ' + noteId);
   $done();
-}
-
-function clip(str, maxLen) {
-  if (!str) return '';
-  return str.length > maxLen ? str.substring(0, maxLen) + '…' : str;
 }
 
 // ======================== 主入口 ========================
