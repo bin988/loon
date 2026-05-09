@@ -1,0 +1,17 @@
+#!name=XHSLikeSaver 小红书点赞自动保存 (>=iOS15)
+#!desc=点赞小红书笔记时自动保存图片/视频到手机相册。支持图文笔记和视频笔记。
+#!author=Claude
+#!icon=https://sns-avatar-qc.xhscdn.com/avatar/1040g2jo31ut85ejniq005na2jo85gpu80o43hbo?imageView2/2/w/120/format/jpg
+
+[MITM]
+hostname = edith.xiaohongshu.com
+
+[Script]
+# 缓存图文笔记的图片信息（拦截笔记详情流响应）
+http-response ^https?://edith\.xiaohongshu\.com/api/sns/v1/note/imagefeed requires-body=true, timeout=30, tag=XHSCacheImagefeed, script-path=https://raw.githubusercontent.com/bin988/loon/refs/heads/main/xhs_like_saver.js
+
+# 缓存视频笔记信息（拦截预加载响应，获取视频地址）
+http-response ^https?://edith\.xiaohongshu\.com/api/sns/v1/note/detailfeed/preload requires-body=true, timeout=30, tag=XHSCachePreload, script-path=https://raw.githubusercontent.com/bin988/loon/refs/heads/main/xhs_like_saver.js
+
+# 监听点赞操作，触发保存到相册
+http-response ^https?://edith\.xiaohongshu\.com/api/sns/v1/note/like requires-body=true, timeout=60, tag=XHSLikeSave, script-path=https://raw.githubusercontent.com/bin988/loon/refs/heads/main/xhs_like_saver.js
